@@ -1,0 +1,619 @@
+---
+title: "Final Exam" 
+author: "Richard 'Ricky' Kuehn"
+format: ds6030hw-html
+---
+
+::: {style="background-color:yellow; color:red; display: block; border-color: black; padding:1em; padding-bottom: .5em;"}
+This is an **independent assignment**. Do not discuss or work with classmates.
+:::
+
+```{r config, include=FALSE}
+# Set global configurations and settings here
+knitr::opts_chunk$set()                 # set global chunk options
+ggplot2::theme_set(ggplot2::theme_bw()) # set ggplot2 theme
+```
+
+# Grading Notes
+
+- The exam is graded out of 100 pts.
+- 20 points are given for overall style and ease of reading. If you don't use the homework format or print out pages of unnecessary output the style points will be reduced. 
+- The point totals for each question are provided below.
+- Be sure to show your work so you can get partial credit even if your solution is wrong. 
+
+# Required R packages and Directories {.unnumbered .unlisted}
+
+```{r packages, message=FALSE, warning=FALSE}
+data_dir = 'https://mdporter.github.io/teaching/data' # data directory
+library(tidyverse)    # functions for data manipulation   
+library(mclust)       # model based clustering
+library(mixtools)     # for poisson mixture models
+library(broom)
+library(tidymodels)
+library(recipes)
+library(lubridate)
+library(probably)
+```
+
+
+# Problem 1: Customer Segmentation (15 pts)
+
+RFM analysis is an approach that some businesses use to understand their customers' activities. At any point in time, a company can measure how recently a customer purchased a product (Recency), how many times they purchased a product (Frequency), and how much they have spent (Monetary Value). There are many ad-hoc attempts to segment/cluster customers based on the RFM scores (e.g., here is one based on using the customers' rank of each dimension independently: <https://joaocorreia.io/blog/rfm-analysis-increase-sales-by-segmenting-your-customers.html>). In this problem you will use the clustering methods we covered in class to segment the customers. 
+
+The data for this problem can be found here: <`r file.path(data_dir, "RFM.csv")`>. Cluster based on the `Recency`, `Frequency`, and `Monetary` features.
+
+## a. Load the data (3 pts)
+
+::: {.callout-note title="Solution"}
+```{r}
+rfm <- read.csv(file.path(data_dir, "RFM.csv"))
+```
+```{r}
+head(rfm)
+```
+```{r}
+summary(rfm)
+```
+:::
+
+
+## b. Implement hierarchical clustering. (3 pts)
+
+- Describe any pre-processing steps you took (e.g., scaling, distance metric)
+- State the linkage method you used with justification. 
+- Show the resulting dendrogram.
+- State the number of segments/clusters you used with justification. 
+- Using your segmentation, are customers 1 and 12 in the same cluster?     
+
+::: {.callout-note title="Solution"}
+```{r}
+# scale as there is a range values
+rfm_s <- scale(rfm[, c("Recency", "Frequency", "Monetary")])
+
+# create distance object
+dX <- dist(rfm_s, method = "euclidean")
+```
+***Justification for linkage method:***  \
+*I will use average linkage because it looks at the overall similarity between groups, tends to find clusters that are more robust and interpretable, and helps identify natural groupings rather than forcing cluster shapes.*
+```{r}
+# hierarchical clustering 
+hi_clust <- hclust(dX, method = "average")
+```
+
+```{r}
+# plot dendrogram
+plot(as.dendrogram(hi_clust), las = 1, 
+     main = "RFM Customer Segmentation",
+     ylab = "height", leaflab = "none")
+```
+
+```{r}
+# height plot
+tibble(height = hi_clust$height, K = row_number(-height)) |>
+ggplot(aes(K, height)) +
+geom_line() +
+geom_point(aes(color = ifelse(K== 3 | K==11, "red", "black"))) +
+scale_color_identity() +
+coord_cartesian(xlim=c(1, 30))
+```
+***Justification for K clusters:***  \
+*Based on the height plot, I am selecting K = 3 clusters because there is a notable elbow at this point. Three clusters provides a good balance between having too few clusters (which combines dissimilar groups) and too many clusters (which creates unnecessary divisions in the data). There is another elbow at K = 11, but in our context of customer segments, I find this to be too many.*
+```{r}
+# cutree for K = 3
+clusters = cutree(hi_clust, k=3)
+clusters |> table()
+```
+
+```{r}
+# check customer 1 and 12 for K = 3
+data.frame(
+  customer = c(1, 12),
+  cluster = clusters[c(1, 12)],
+  recency = rfm$Recency[c(1, 12)],
+  frequency = rfm$Frequency[c(1, 12)],
+  monetary = rfm$Monetary[c(1, 12)]
+) %>%
+  mutate(monetary = round(monetary, 2))
+```
+***Customer 1 and 12:***  \
+*Both of these customers are in cluster 1 when K = 3. Because there was another elbow in the height plot, I will use cutree for K = 11 to see if that moves either customer to a different cluster.*
+```{r}
+# cutree for K = 11
+clusters11 = cutree(hi_clust, k=11)
+clusters11 |> table()
+```
+```{r}
+# check customer 1 and 12 for K = 11
+data.frame(
+  customer = c(1, 12),
+  cluster = clusters11[c(1, 12)],
+  recency = rfm$Recency[c(1, 12)],
+  frequency = rfm$Frequency[c(1, 12)],
+  monetary = rfm$Monetary[c(1, 12)]
+) %>%
+  mutate(monetary = round(monetary, 2))
+```
+*Even when we change K to 11, customer 1 and 12 belong to cluster 1.*
+:::
+
+## c. Implement k-means.  (3 pts)
+
+- Describe any pre-processing steps you took (e.g., scaling)
+- State the number of segments/clusters you used with justification. 
+- Using your segmentation, are customers 1 and 12 in the same cluster?     
+    
+::: {.callout-note title="Solution"}
+```{r}
+# scale as there is a range of values
+rfm_s <- scale(rfm[, c("Recency", "Frequency", "Monetary")])
+```
+
+```{r}
+# find optimal K
+Kmax = 7
+set.seed(101) 
+SSE = numeric(Kmax)
+
+for(k in 1:Kmax) {
+  km = kmeans(rfm_s, centers=k, nstart=100)
+  SSE[k] = km$tot.withinss
+}
+```
+
+```{r}
+# SSE plot
+tibble(K = 1:Kmax, SSE) %>%
+  ggplot(aes(K, SSE)) +
+  geom_line() +
+  geom_point() +
+  labs(title = "K-means")
+```
+***Justification for K clusters:***  \
+*I will be using 3 clusters as that is where we see the elbow in the SSE plot. It is also justified that we found the same elbow with hierarchical clustering.*
+```{r}
+# fit
+set.seed(101)
+fit = kmeans(rfm_s, centers=3, nstart=100)
+broom::augment(fit, rfm_s) |> head()
+```
+```{r}
+broom::tidy(fit)
+```
+```{r}
+# check customer 1 and 12
+data.frame(
+  customer = c(1, 12),
+  cluster = fit$cluster[c(1, 12)],
+  Recency = rfm$Recency[c(1, 12)],
+  Frequency = rfm$Frequency[c(1, 12)],
+  Monetary = rfm$Monetary[c(1, 12)]
+) %>%
+  mutate(Monetary = round(Monetary, 2))
+```
+*Using K-means with 3 clusters, customer 1 and 12 are part of cluster 2.*
+:::
+
+## d. Implement model-based clustering (3 pts)
+
+- Describe any pre-processing steps you took (e.g., scaling)
+- State the number of segments/clusters you used with justification. 
+- Describe the best model. What restrictions are on the shape of the components?
+- Using your segmentation, are customers 1 and 100 in the same cluster?     
+
+::: {.callout-note title="Solution"}
+```{r}
+# scale as there is a range of values
+rfm_s <- scale(rfm[, c("Recency", "Frequency", "Monetary")])
+```
+
+```{r}
+# fit model-based clustering
+set.seed(101)
+mix = Mclust(rfm_s, verbose=FALSE)
+summary(mix)
+```
+
+***Justification for K clusters:***  \
+*The mclust package suggests that the best model has 9 clusters, which is more complex than what we found through hierarchical and k-means. Mclust uses BIC optimization.*
+
+***Best Model:***  \
+*Our mclust model is VVV (ellipsoidal, varying volume, shape, and orientation) with 9 components. The first V stands for variable volume, so clusters can have different sizes. The second stands for variable shape, so they have have different shapes. The third stands for variable orientation, so the clusters can be oriented in different directions. This model provides maximum flexibility in fitting as it it allows each cluster to have its own geometric properties.*
+
+```{r}
+# check customer 1 and 100
+data.frame(
+  customer = c(1, 100),
+  cluster = mix$classification[c(1, 100)],
+  recency = rfm$Recency[c(1, 100)],
+  frequency = rfm$Frequency[c(1, 100)],
+  monetary = rfm$Monetary[c(1, 100)]
+) %>%
+  mutate(monetary = round(monetary, 2))
+```
+*In our mixed model, customer 1 and 100 are in different clusters (7, 2 respectively).*
+:::
+
+## e. Discussion of results (3 pts)
+
+Discuss how you would cluster the customers if you had to do this for your job. Do you think one model would do better than the others? 
+
+::: {.callout-note title="Solution"}
+I recommend hierarchical clustering for RFM customer segmentation. While K-means offers simplicity and model-based clustering provides optimization, hierarchical clustering's dendrogram reveals the relationships between customer segments at different granularities. This allows different business units to work with varying levels of detail from the same analysis - so strategists can use broad segments while marketing could investigate smaller subsegments. 
+:::
+
+
+# Problem 2: Unbalanced Data (15 pts)
+
+A researcher is trying to build a predictive model for distinguishing between real and AI generated images. She collected a random sample ($n=10,000$) of tweets/posts that included images. Expert analysts were hired to label the images as real or AI generated. They determined that 1000 were AI generated and 9000 were real. 
+
+She tasked her grad student with building a logistic regression model to predict the probability that a new image is AI generated. After reading on the internet, the grad student became concerned that the data was *unbalanced* and fit the model using a weighted log-loss 
+$$
+-\sum_{i=1}^n w_i \left[ y_i \log \hat{p}(x_i) + (1-y_i) \log (1-\hat{p}(x_i)) \right]
+$$
+where $y_i = 1$ if AI generated ($y_i=0$ if real) and $w_i = 1$ if $y_i = 1$ (AI) and $w_i = 1/9$ if $y_i = 0$ (real). This makes $\sum_i w_iy_i = \sum_i w_i(1-y_i) = 1000$. That is the total weight of the AI images equals the total weight of the real images. Note: An similar alternative is to downsample the real images; that is, build a model with 1000 AI and a random sample of 1000 real images. The grad student fits the model using the weights and is able to make predictions $\hat{p}(x)$. 
+
+While the grad student is busy implementing this model, the researcher grabbed another 1000 random tweets/posts with images and had the experts again label them real or AI. Excitedly, the grad student makes predictions on the test data. However, the model doesn't seem to be working well on these new test images. While the AUC appears good, the log-loss and brier scores are really bad.
+
+Hint: By using the weights (or undersampling), the grad student is modifying the base rate (prior class probability).
+
+## a. What is going on? (5 pts)
+
+How can the AUC be strong while the log-loss and brier scores aren't. 
+
+::: {.callout-note title="Solution"}
+AUC is a rank-based metric and doesn't assess the actual probabilities. Log-loss and Brier scores assess the accuracy of probabilities themselves. In this instance, the model ranks AI images higher than the real images, but the probabilities are overconfident because it assumes P(AI) = 0.5 when in reality P(AI) = 0.1.
+:::
+
+## b. What is the remedy? (5 pts)
+
+Specifically, how should the grad student adjust the predictions for the new test images? Use equations and show your work. Hints: the model is outputting $\hat{p}(x) = \widehat{\Pr}(Y=1|X=x)$; consider the log odds and Bayes theorem.
+
+::: {.callout-note title="Solution"}
+Use Bayes' theorem to adjust for true class proportions (model's predicted log-odds + true proportions):
+
+***log(P(Y=1|x)/P(Y=0|x)) = log(p̂(x)/(1-p̂(x))) + log(0.1/0.9)***
+
+Then convert back to probability by inserting into logistic function (1/(1 + e^(-z)) for z:
+
+***P(Y=1|x) = 1/(1 + e^(-[log(p̂(x)/(1-p̂(x))) + log(0.1/0.9)]))***
+
+This adjusts the model's predictions from 50-50 probabilities to the true 10-90 split.
+:::
+
+## c. Base rate correction (5 pts)
+
+If the grad student's weighted model predicts an image is AI generated with $\hat{p}(x) = .80$, what is the updated prediction under the assumption that the true proportion of AI is 1/10. 
+
+::: {.callout-note title="Solution"}
+***formula: log(p̂(x)/(1-p̂(x))) + log(0.1/0.9)***  \
+
+*log(0.8/(1-0.8)) + log(0.1/0.9) = 1.3862944 + -2.1972246 = -0.8109302*  \
+
+***formula: 1/(1 + e^(-(z)))***  \
+
+*1/(1 + e^(-(-0.8109302))) = 0.308*  \
+
+So our updated prediction is 30.8% the image is AI which is much closer to the 10-90 split.
+:::
+
+
+# Problem 3: Multiclass Classification (10 pts)
+
+You have built a predictive model that outputs a probability vector $\hat{p}(x) = [\hat{p}_1(x), \hat{p}_2(x), \hat{p}_3(x)]$ for a 3-class categorical output. 
+Consider the following loss matrix which includes an option to return *No Decision* if there is too much uncertainty in the label:
+
+|        | $\hat{G} =1$| $\hat{G} =2$| $\hat{G} =3$| No Decision|
+|:-------|------------:|------------:|------------:|-----------:|
+|$G = 1$ |            0|            2|            2|           1|
+|$G = 2$ |            1|            0|            2|           1|
+|$G = 3$ |            1|            1|            0|           1|
+
+
+What label would you output if the estimated probability is: $\hat{p}(x) = [0.25, 0.15, 0.60]$. Show your work.
+
+::: {.callout-note title="Solution"}
+**Expected loss:**
+
+For G1: 0.25 * 0 + 0.15 * 1 + 0.60 * 1 = 0.75
+
+For G2: 0.25 * 2 + 0.15 * 0 + 0.60 * 1 = 1.10
+
+For G3: 0.25 * 2 + 0.15 * 2 + 0.60 * 0 = 0.8
+
+For No Decision: 0.25 * 1 + 0.15 * 1 + 0.60 * 1 = 1
+
+***Using minimum expected loss, my output would be G1***
+:::
+
+# Problem 4: Donor Acceptance Modeling (40 pts)
+
+::: {style="background-color:blue; color:yellow; display: block; border-color: black; padding:1em; padding-bottom: .5em;"}
+The data for this problem is for your private use on this exam only. You may not share or use for any other purposes. 
+:::
+
+This challenge has you predicting the probability that a pediatric donor heart offer will be Accepted or Rejected. Use the `donor_accept_train.csv` data (available in Canvas) to build a model to predict the probability of `outcome = "Accept"`. The test data `donor_accept_test.csv` is used for making predictions. 
+
+A description of the transplant system and variables is provided in `donor_accept_vars.html`.
+
+Hints: 
+
+- There are four parts to this problem. Before you being think about how your approach will address all four (for example, your choice of model(s) in part a may influence your approach to part c). 
+
+- As always, *before you start coding* write out each step of the process. Think about inputs and outputs. 
+
+
+## a. Probability Prediction Contest (10 pts)
+
+Build a model to predict the probability that an offer will be accepted. Performance is evaluated using log-loss. 
+
+
+*Contest Submission:* 
+
+- Submit your predictions on the `donor_accept_test.csv` data. Create a .csv file (ensure comma separated format) named `lastname_firstname.csv` that includes the column named "prob_accept" that is your estimated posterior probability. We will use automated evaluation, so the format must be exact. 
+
+
+*Notes:*
+
+- I suggest you quickly make an initial model without doing any feature engineering or much tuning. There are a lot of features, an endless number of feature engineering tasks, many predictive models each with many tuning parameters to choose from. But just get something that correctly outputs probabilities and use it to complete the other parts to this problem. You can always come back and improve the model if your time permits. 
+
+- You must show your code. Because your code may take some time to run, you may want to run the model outside this notebook. If you do so, copy the final code into this notebook and set `eval=FALSE` in the corresponding code chunk(s) so we can see the code, but it won't run when the notebook compiles. 
+
+
+*Competition Grading:*
+
+- 2 of the 10 points are based on readable code
+- 3 of the 10 points are based on a valid submission (e.g., correct number of rows and log-loss beats an intercept only model)
+- The remaining 5 points are based on your predictive performance. The top score will receive all 5, the second best 4.93, third best 4.85, etc.  
+
+
+::: {.callout-note title="Solution"}
+```{r}
+# load training data -> preprocess data types
+d_train <- read.csv("donor_accept_train.csv") |>
+    mutate(
+      outcome = factor(outcome, levels = c("Reject", "Accept")),
+      OFFER_DATE = ymd(OFFER_DATE),
+      across(c(ABNL_ECHO_CUM, LVSWMA, ECHO_OBJECTIVE, VALVE_FXN, 
+               ECHO_QUAL, GLOBAL_VENT_DYSF, PULSE_high, BP_high, 
+               BP_low, DON_HOSP_TX), 
+             ~factor(.x, levels = c(0, 1)))) |>
+    select(-OFFER_ID)
+
+# load testing data -> preprocess data types
+d_test <- read.csv("donor_accept_test.csv") |>
+    mutate(
+      OFFER_DATE = ymd(OFFER_DATE),
+      across(c(ABNL_ECHO_CUM, LVSWMA, ECHO_OBJECTIVE, VALVE_FXN, 
+               ECHO_QUAL, GLOBAL_VENT_DYSF, PULSE_high, BP_high, 
+               BP_low, DON_HOSP_TX), 
+             ~factor(.x, levels = c(0, 1))))|>
+    select(-OFFER_ID)
+```
+
+```{r}
+# recipe
+d_recipe <- recipe(outcome ~ ., data = d_train) |>
+  # extract date features
+  step_date(OFFER_DATE, features = c("year", "month")) |>
+  step_rm(OFFER_DATE) |>
+  
+  # categorical variables
+  step_string2factor(all_nominal_predictors()) |>
+  step_novel(all_nominal_predictors()) |>
+  step_unknown(all_nominal_predictors()) |>
+  
+  # dummy variables
+  step_dummy(all_nominal_predictors()) |>
+  
+  # remove zero variance
+  step_zv(all_predictors()) |>
+  
+  # numeric variables, normalize
+  step_impute_median(all_numeric_predictors()) |>
+  step_normalize(all_numeric_predictors())
+```
+
+```{r}
+# lasso regression
+d_spec <- logistic_reg(penalty = tune(), mixture = 1) |>
+  set_engine("glmnet") |>
+  set_mode("classification")
+```
+
+```{r}
+# cv folds for tuning
+set.seed(101)
+d_folds <- vfold_cv(d_train, v = 5)
+```
+
+```{r}
+# workflow
+d_wf <- workflow() |>
+  add_recipe(d_recipe) |>
+  add_model(d_spec)
+```
+
+```{r}
+# penalty grid
+pen_grid <- grid_regular(
+  penalty(range = c(-3, 0)), # log10 scale from 0.001 to 1
+  levels = 20)
+```
+
+```{r}
+# tune
+tune_res <- tune_grid(
+  d_wf,
+  resamples = d_folds,
+  grid = pen_grid,
+  metrics = metric_set(mn_log_loss))
+```
+
+```{r}
+# best penalty
+best_pen <- select_best(tune_res, metric = "mn_log_loss")
+```
+
+```{r}
+# workflow w/ best penalty
+best_wf <- d_wf |>
+  finalize_workflow(best_pen)
+```
+
+```{r}
+# fit final model
+d_fit <- best_wf |>
+  fit(data = d_train)
+```
+
+```{r}
+# predictions
+preds <- predict(d_fit, d_test, type = "prob") |>
+  bind_cols(d_test)
+```
+
+```{r}
+# submission formatting
+submission <- preds |>
+  select(.pred_Accept) |>
+  rename(prob_accept = .pred_Accept)
+
+submission$prob_accept <- format(submission$prob_accept, scientific = FALSE)
+
+# check formatting is correct
+head(submission)
+```
+
+```{r}
+# write submission
+write_csv(submission, "Kuehn_Richard.csv")
+```
+
+:::
+
+
+## b: Hard Classification (10 pts)
+
+Suppose you are asked to make a hard classification using the probabilities from part a. Making a false negative is 4 times worse that making a false positive (i.e., $C_{FN} = 4*C_{FP}$).
+
+- What threshold should be used with your predictions? How did you choose? 
+
+::: {.callout-note title="Solution"}
+**C_fn = 4 * C_fp**  \
+
+**threshold = C_fp / (C_fp + C_fn)**  \
+
+**threshold = 1 / (1 + 4) = 0.2**  \
+
+We should classify "Accept" when our predicted probability is >= 0.2 because a false negative is 4 times more costly than a false positive.
+:::
+
+- How many of the offers in the test set are classified as *Accept* using this threshold?
+
+:::{.callout-note title="Solution"}
+```{r}
+# created threshold column 'hard_class'
+submission$hard_class <- ifelse(submission$prob_accept >= 0.2, "Accept", "Reject")
+head(submission)
+```
+
+```{r}
+# value count of 'hard_class'
+table(submission$hard_class)
+```
+
+Using a threshold of 0.2 on my predictions, 219 offers would classify as "Accept".
+:::
+
+## c. Feature Importance (10 pts)
+
+What features are most important? Describe your results and approach in a language that a clinician would want to listen to and can understand. Be clear about the type of feature importance you used, the data (training, testing) that was used to calculate the feature importance scores, and the limitations inherent in your approach to feature importance. 
+
+Notes:
+
+- Your audience is a non-data scientist, so be sure to give a brief high level description of any terms they may not be familiar with. 
+- You wouldn't want to show the clinician the feature importance of all 100+ features. Indicate how to selected the *most* important features to report. 
+- You are not expected to know the clinical meaning of the features. 
+
+:::{.callout-note title="Solution"}
+```{r}
+# extract coefficients
+coefs <- tidy(d_fit) |>
+  arrange(desc(abs(estimate)))
+
+# top features
+head(coefs)
+```
+
+## Feature Importance Results
+
+**How I Analyzed Feature Importance:**
+
+- I used coefficient magnitudes from the LASSO regression model
+- These are like weights where the larger a weight is (positive or negative), the more that factor influences the prediction
+- These weights come from our model's training on historical acceptance decisions (training data).
+
+**Why This Method/Model:**
+
+- LASSO automatically sets unimportant features' weights to zero, helping identify influential factors
+- The weights are standardized, so we can compare them
+
+**Most Influential Factors:**
+
+1. Number of Previous Rejections (-1.17)
+   - Strong negative effect: more rejections → less likely to be accepted
+   
+2. Geographic Distance (-0.68)
+   - Moderate negative effect: greater distances decrease acceptance chances
+
+3. Global Ventricular Dysfunction (-0.55)
+   - Moderate negative effect when abnormal
+
+**Limitations:**
+
+- This only shows what factors historically influenced acceptance decisions, not what should influence them
+- There could be important features missing from the data
+- These relationships show correlation and **not** causation
+- Factors that rarely vary can appear less important than they actually are
+
+:::
+
+## d. Calibration (10 pts)
+
+Assess the calibration of your predictions. There are no points off for having a poorly calibrated model; the purpose of this problem is to demonstrate your knowledge of how to evaluate calibration. 
+
+:::{.callout-note title="Solution"}
+```{r}
+# predictions on training data
+train_preds <- predict(d_fit, d_train, type = "prob") |>
+  bind_cols(d_train)
+```
+
+```{r}
+# bins
+cal_check <- train_preds |>
+  mutate(bin = cut_width(.pred_Accept, width = 0.1)) |>
+  group_by(bin) |>
+  summarize(
+    n = n(),                                   
+    pred_prob = mean(.pred_Accept),            
+    true_prob = mean(outcome == "Accept")  
+  )
+```
+
+```{r}
+# calibration plot
+ggplot(cal_check, aes(x = pred_prob, y = true_prob)) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "gray") +
+  geom_point(aes(size = n)) +
+  labs(
+    x = "Predicted Probability",
+    y = "Observed Proportion",
+    title = "Calibration Plot"
+  ) +
+  theme_minimal()
+```
+
+The calibration plot shows our model's predicted probabilities pretty closely match the actual acceptance rates, though we have more confidence in predictions of low acceptance probabilities where we have more data.
+:::
+

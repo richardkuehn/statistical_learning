@@ -1,0 +1,367 @@
+---
+title: "Homework #8: Boosting" 
+author: "Richard 'Ricky' Kuehn"
+format: ds6030hw-html
+---
+
+::: {style="background-color:yellow; color:red; display: block; border-color: black; padding:1em"}
+This is an **independent assignment**. Do not discuss or work with classmates.
+:::
+
+```{r config, include=FALSE}
+# Set global configurations and settings here
+knitr::opts_chunk$set()                 # set global chunk options
+ggplot2::theme_set(ggplot2::theme_bw()) # set ggplot2 theme
+```
+
+# Required R packages and Directories {.unnumbered .unlisted}
+
+```{r packages, message=FALSE, warning=FALSE}
+# data_url = "https://archive.ics.uci.edu/static/public/275/bike+sharing+dataset.zip"
+library(tidyverse)
+library(lubridate)
+library(padr)
+library(lightgbm)
+```
+
+# Problem 1: Bike Sharing Data
+
+This homework will work with bike rental data from Washington D.C.
+
+## a. Load data
+
+Load the *hourly* `Bikesharing` data from the [UCI ML Repository](https://archive.ics.uci.edu/dataset/275/bike+sharing+dataset).
+
+::: {.callout-note title="Solution"}
+```{r}
+hour <- read.csv("hour.csv")
+hour <- hour |> mutate(dteday = as.Date(dteday))
+head(hour)
+```
+:::
+
+## b. Data Cleaning
+
+Check out the variable descriptions in the [Additional Variable Information](https://archive.ics.uci.edu/dataset/275/bike+sharing+dataset). To prepare the data for modeling, do the following:
+
+1.  Convert the `weathersit` to an *ordered factor*.
+2.  Unnormalize `temp` and `atemp` and convert to Fahrenheit.
+3.  Unnormalize `windspeed`.
+
+::: {.callout-note title="Solution"}
+**1.**
+
+```{r}
+table(hour$weathersit)
+```
+
+```{r}
+hour$weathersit <- factor(hour$weathersit, levels = c(1, 2, 3, 4), 
+                          labels = c("Clear", "Mist", "Light Precipitation", "Heavy Precipitation"),
+                          ordered = TRUE)
+```
+
+```{r}
+table(hour$weathersit)
+```
+
+**2.**
+
+```{r}
+summary(hour$temp)
+summary(hour$atemp)
+```
+
+```{r}
+# new_temp <- (og_temp - t_min)/(t_max - t_min)
+# og_temp <- new_temp * (t_max - t_min) + t_min
+t_min <- -8
+t_max <- 39
+hour$temp <- hour$temp * (t_max - t_min) + t_min
+
+a.t_min <- -16
+a.t_max <- 50
+hour$atemp <- hour$atemp * (a.t_max - a.t_min) + a.t_min
+```
+
+```{r}
+summary(hour$temp)
+summary(hour$atemp)
+```
+
+**3.**
+
+```{r}
+summary(hour$windspeed)
+```
+
+```{r}
+# The values are divided to 67 (max)
+hour$windspeed <- hour$windspeed * 67
+```
+
+```{r}
+summary(hour$windspeed)
+```
+:::
+
+## c. Missing times
+
+Not every hour of every day is represented in these data. Some times, like 2011-03-15 hr=3, is due to daylight savings time. Other times, like 2011-01-02 hr=5, is probably due to the data collection process which ignored any times when `cnt = 0`.
+
+This may not be perfect, but do the following to account for missing times:
+
+1.  Create new rows/observations for all missing date-hr combinations that we think are due to actual zero counts. That is, exclude daylight savings. Set the outcome variables to zero (`causal = 0`, `registered = 0`, and `cnt = 0`) for these new observations. `tidyr::complete()` can help.
+
+2.  Fill in the other missing feature values with values from previous hour. For example, the `temp` for 2011-01-02 **hr=5** should be set to the `temp` from the non-missing 2011-01-02 **hr=4**. `tidyr::fill()` can help.
+
+::: {.callout-note title="Solution"}
+```{r}
+table(hour$hr)
+```
+
+```{r}
+# find missing hours
+hour_analysis <- hour |>
+  arrange(dteday, hr) |>
+  group_by(dteday) |>
+  mutate(
+    prev_hr = lag(hr),
+    hr_gap = hr - coalesce(prev_hr, hr - 1)
+  ) |>
+  ungroup()
+
+missing_hours <- hour_analysis |>
+  filter(hr_gap > 1) |>
+  select(dteday, hr, prev_hr, hr_gap)
+```
+
+```{r}
+missing_hours
+```
+
+```{r}
+# exclude daylight savings, complete missing hours using values from below, replace na for last 3 columns with 0
+hour2 <- hour %>%
+  complete(
+    dteday = unique(dteday),
+    hr = 0:23
+  ) %>%
+  filter(!(
+    (dteday == '2011-03-13' & hr == 2) |
+    (dteday == '2012-03-11' & hr == 2)
+  )) %>%
+  fill(instant, season, yr, mnth, holiday, weekday, workingday, 
+       weathersit, temp, atemp, hum, windspeed) %>%
+  mutate(
+    casual = replace_na(casual, 0),
+    registered = replace_na(registered, 0),
+    cnt = replace_na(cnt, 0)
+  )
+```
+
+```{r}
+# check to make sure same count of hour values minus 2 for hour 2 because of 'leap forward'
+table(hour2$hr)
+```
+
+```{r}
+# convert to df, update instant column, set row names
+hour2 <- hour2 %>%
+  arrange(dteday, hr) %>%
+  mutate(instant = 1:n()) %>%
+  as.data.frame()
+
+row.names(hour2) <- hour2$instant
+hour2 <- hour2 %>% select(-instant)
+```
+
+```{r}
+head(hour2, n=72)
+```
+:::
+
+## d. New predictors
+
+1.  Add the variable `doy` to represent the day of the year (1-366).
+2.  Add the variable `days` to represent the *fractional number of days* since `2011-01-01`. For example hr=2 of 2011-01-02 is `r round(1 + 2/24, 3)`.
+3.  Add lagged counts: autoregressive. Add the variable `cnt_ar` to be the `cnt` in the previous hour. You will need to set the value for `cnt_ar` for the 1st observation.\
+4.  Add lagged counts: same time previous day, or a lag of 24 hours. You will need to set the values for the first 24 hours.
+
+Hints:
+
+-   The `lubridate` package (part of `tidymodels`) is useful for dealing with dates and times.
+-   `dplyr::lag()` can help with making the lagged variables.
+
+::: {.callout-note title="Solution"}
+```{r}
+hour2 <- hour2 %>%
+  mutate(
+    doy = yday(dteday),
+    days = round(as.numeric(difftime(dteday, as.Date("2011-01-01"), units = "days")) + hr/24, 3)
+  ) %>%
+  arrange(dteday, hr) %>%
+  mutate(
+    cnt_ar = lag(cnt),
+    cnt_lag24 = lag(cnt, 24)
+  )
+
+hour2$cnt_ar[1] <- 0
+hour2$cnt_lag24[1:24] <- 0
+```
+
+```{r}
+head(hour2, n = 48)
+```
+:::
+
+## e. Train-Test split
+
+Randomly select 1000 observations for the test set and use the remaining for training.
+
+::: {.callout-note title="Solution"}
+```{r}
+set.seed(123)
+test_ind <- sample(1:nrow(hour2), 1000)
+train <- hour2[-test_ind,]
+test <- hour2[test_ind,]
+```
+:::
+
+# Problem 2: Predicting bike rentals
+
+## a. Poisson loss
+
+The outcome variables, number of renters, are counts (i.e., non-negative integers). For count data, the variance often scales with the expected count. One way to accommodate this is to model the counts as a Poisson distribution with rate $\lambda_i = \lambda(x_i)$. In lightgbm, the "poisson" objective uses an ensemble of trees to model the *log of the rate* $F(x) = \log \lambda(x)$. The poisson loss function (negative log likelihood) for prediction $F_i = \log \lambda_i$ is $\ell(y_i, F_i) = -y_iF_i + e^{F_i}$ where $y_i$ is the count for observation $i$ and $F_i$ is the ensemble prediction.
+
+-   Given the current prediction $\hat{F}_i$, what is the *gradient* and *hessian* for observation $i$?
+-   Page 12 of the [Taylor Expansion notes](lectures/taylor-expansion.pdf) shows that each new iteration of boosting attempts to find the tree that minimizes $\sum_i w_i (z_i - \hat{f}(x_i))^2$. What are the values for $w_i$ and $z_i$ for the "poisson" objective (in terms of $\hat{\lambda}_i$ *or* $e^{\hat{F}_i}$).
+
+::: {.callout-note title="Solution"}
+gradient and hessian for Poisson loss are:
+
+gradient: y_i - $\lambda_i$ = y_i - e\^F_i
+
+hessian: $\lambda_i$ = e\^F_i
+
+Taylor expansion minimization...
+
+w_i = e\^F_i
+
+z_i = (y_i - e\^F_i) / e\^F_i = y_i / e\^F_i - 1
+:::
+
+## b. LightGBM Tuning
+
+Tune a lightgbm model on the training data to predict the number of total number of renters (`cnt`). Do *not* use `registered` or `causal` as predictors!
+
+-   Use the "poisson" objective; this is a good starting place for count data. This sets the loss function to the negative Poisson log-likelihood.
+
+-   You need to tune at least two parameters: one related to the complexity of the trees (e.g., tree depth) and another related to the complexity of the ensemble (e.g., number of trees/iterations). [LightGBM documentation on parameter tuning](https://lightgbm.readthedocs.io/en/latest/Parameters-Tuning.html). And [LightGBM list of all parameters](https://github.com/microsoft/LightGBM/blob/master/docs/Parameters.rst).
+
+-   You are free to tune other parameters as well, just be cautious of how long you are willing to wait for results.
+
+i.  List relevant tuning parameter values, even those left at their default values. Indicate which values are non-default (either through tuning or just selecting). You can get these from the `params` element of a fitted lightgbm model, e.g., `lgbm_fitted$params`.
+
+ii. Indicate what method was used for tuning (e.g., type of cross-validation).
+
+::: {.callout-note title="Solution"}
+```{r}
+feature_cols <- setdiff(names(train), 
+                       c("registered", "casual", "cnt", "dteday"))
+```
+```{r}
+train_matrix <- sapply(train[, feature_cols], as.numeric)
+train_lgb <- lgb.Dataset(
+  data = as.matrix(train_matrix),
+  label = train$cnt,
+  free_raw_data = FALSE
+)
+```
+```{r}
+params <- list(
+  objective = "poisson",  # specified
+  metric = "poisson",     # specified
+  boosting = "gbdt",      # default
+  num_leaves = 31,        # default          
+  min_data_in_leaf = 20   # default
+)
+learning_rate <- c(0.01, 0.03, 0.5, 0.7)  
+max_depths <- c(4, 6, 8, 10)           
+num_iterations <- c(100, 250, 400, 550)
+```
+```{r}
+cv_results <- expand.grid(
+ learning_rate = learning_rate,
+ max_depth = max_depths,
+ nrounds = num_iterations,
+ poisson_loss = NA
+)
+```
+```{r}
+for(i in 1:nrow(cv_results)) {
+ current_params <- c(params,
+                    list(learning_rate = cv_results$learning_rate[i],
+                         max_depth = cv_results$max_depth[i]))
+ 
+ cv <- lgb.cv(
+   params = current_params,
+   data = train_lgb,
+   nfold = 5,
+   nrounds = cv_results$nrounds[i],
+   early_stopping_rounds = 10,
+   verbose = -1
+ )
+ 
+ cv_results$poisson_loss[i] <- min(unlist(cv$record_evals$valid$poisson$eval))
+}
+```
+```{r}
+best_params <- cv_results[which.min(cv_results$poisson_loss), ]
+best_params
+```
+
+```{r}
+final_model <- lgb.train(
+ params = c(params, 
+           list(max_depth = best_params$max_depth,
+                learning_rate = best_params$learning_rate)),
+ data = train_lgb,
+ nrounds = best_params$nrounds,
+ verbose = -1
+)
+```
+
+:::
+
+## c. Evaluation
+
+Make predictions on the test data and evaluate. Report the point estimate and 95% confidence interval for the poisson log loss *and* the mean absolute error.
+
+::: {.callout-note title="Solution"}
+```{r}
+test_matrix <- sapply(test[, feature_cols], as.numeric)
+predictions <- predict(final_model, as.matrix(test_matrix))
+```
+```{r}
+poisson_loss <- function(y_true, y_pred) {
+  -mean(y_true * log(y_pred) - y_pred)
+}
+pll <- poisson_loss(test$cnt, predictions)
+```
+```{r}
+mae <- mean(abs(test$cnt - predictions))
+pll_se <- sd(-test$cnt * log(predictions) + predictions)/sqrt(length(predictions))
+mae_se <- sd(abs(test$cnt - predictions))/sqrt(length(predictions))
+```
+```{r}
+cat(sprintf("Poisson Loss: %.3f [%.3f, %.3f]\n",
+           pll, pll - 1.96*pll_se, pll + 1.96*pll_se))
+
+cat(sprintf("MAE: %.1f [%.1f, %.1f]",
+           mae, mae - 1.96*mae_se, mae + 1.96*mae_se))
+```
+:::
+
+
+

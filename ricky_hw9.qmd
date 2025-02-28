@@ -1,0 +1,647 @@
+---
+title: "Homework #9: Feature Importance" 
+author: "Richard 'Ricky' Kuehn"
+format: ds6030hw-html
+---
+
+```{r config, include=FALSE}
+# Set global configurations and settings here
+knitr::opts_chunk$set()                 # set global chunk options
+ggplot2::theme_set(ggplot2::theme_bw()) # set ggplot2 theme
+```
+
+# Required R packages and Directories {.unnumbered .unlisted}
+
+```{r packages, message=FALSE, warning=FALSE}
+dir_data = 'https://mdporter.github.io/teaching/data/' # data directory
+library(tidyverse) # functions for data manipulation
+library(tidymodels)
+library(vip)
+```
+
+# Problem 1: Permutation Feature Importance
+
+Vanderbilt Biostats has collected data on Titanic survivors
+(https://hbiostat.org/data/). I have done some simple processing and
+split into a training and test sets.
+
+-   [titanic_train.csv](%60r%20file.path(dir_data,%20%22titanic_train.csv%22)%60)
+-   [titanic_test.csv](%60r%20file.path(dir_data,%20%22titanic_test.csv%22)%60)
+
+We are going to use this data to investigate feature importance. Use
+`Class`, `Sex`, `Age`, `Fare`, `sibsp` (number of siblings or spouse on
+board), `parch` (number of parents or children on board), and `Joined`
+(city where passenger boarded) for the predictor variables (features)
+and `Survived` as the outcome variable.
+
+## a. Load the titanic traning and testing data
+
+::: {.callout-note title="Solution"}
+```{r}
+train <- read.csv(paste0(dir_data, 'titanic_train.csv'))
+test <- read.csv(paste0(dir_data, 'titanic_test.csv'))
+```
+
+```{r}
+train <- subset(train, select = c(Class, Sex, Age, Fare, sibsp, parch, Joined, Survived))
+test <- subset(test, select = c(Class, Sex, Age, Fare, sibsp, parch, Joined, Survived))
+```
+
+```{r}
+head(train)
+head(test)
+```
+
+```{r}
+train <- train |>
+  mutate(
+    Survived = factor(Survived),
+    Class = factor(Class),
+    Sex = factor(Sex),
+    Joined = factor(Joined),
+    Age = as.integer(Age)
+  )
+
+test <- test |>
+  mutate(
+    Survived = factor(Survived),
+    Class = factor(Class),
+    Sex = factor(Sex),
+    Joined = factor(Joined),
+    Age = as.integer(Age)
+  )
+```
+
+```{r}
+train <- train |>
+  mutate(Survived = factor(Survived, levels = c("0", "1"))) 
+
+test <- test |>
+  mutate(Survived = factor(Survived, levels = c("0", "1")))
+```
+
+```{r}
+rf_rec <- recipe(Survived ~ ., data = train) |>
+  step_normalize(all_numeric_predictors()) |>
+  step_impute_median(all_numeric_predictors())
+```
+:::
+
+## b. Method 1: Built-in importance scores
+
+Fit a tree ensemble model (e.g., Random Forest, boosted tree) on the
+training data. You are free to use any method to select the tuning
+parameters.
+
+Report the built-in feature importance scores and produce a barplot with
+feature on the x-axis and importance on the y-axis.
+
+::: {.callout-note title="Solution"}
+```{r}
+set.seed(101)
+```
+
+```{r}
+# random forest
+rf_spec <- rand_forest(
+  mtry = tune(),
+  trees = 1000,
+  min_n = tune()
+) |>
+  set_engine("ranger", importance = "impurity", probability = TRUE) |>
+  set_mode("classification")
+```
+
+```{r}
+# workflow
+rf_wflow <- workflow() |>
+  add_recipe(rf_rec) |>
+  add_model(rf_spec)
+```
+
+```{r}
+# cv
+cv_folds <- vfold_cv(train, v = 10, strata = Survived)
+```
+
+```{r}
+# tuning grid
+rf_grid <- grid_regular(
+  mtry(range = c(2, 7)),  
+  min_n(range = c(4, 14)), 
+  levels = c(6, 6)
+)
+
+rf_grid
+```
+
+```{r}
+# tune model
+rf_tuned <- rf_wflow |>
+  tune_grid(
+    resamples = cv_folds,
+    grid = rf_grid,
+    metrics = metric_set(mn_log_loss),
+    control = control_grid(event_level = "second")
+  )
+```
+
+```{r}
+rf_tuned |> collect_metrics() |> arrange(mean)
+```
+
+```{r}
+# best params
+best_params <- select_best(rf_tuned, metric = "mn_log_loss")
+best_params
+```
+
+```{r}
+# fit with best params
+rf_final <- rf_wflow |>
+  finalize_workflow(best_params) |>
+  fit(data = train)
+```
+
+```{r}
+# importance plot
+importance_plot <- rf_final |>
+  extract_fit_parsnip() |>
+  vip(num_features = 7) +
+  theme_minimal() +
+  labs(title = "Random Forest Feature Importance")
+
+print(importance_plot)
+```
+:::
+
+## c. Performance
+
+Report the performance of the model fit from (a.) on the test data. Use
+the log-loss (where $M$ is the size of the test data): $$ 
+\text{log-loss}(\hat{p}) = - \frac{1}{M} \sum_{i=1}^m [y_i \log \, \hat{p}_i + (1 - y_i) \log \, (1 - \hat{p}_i)] $$
+
+::: {.callout-note title="Solution"}
+```{r}
+# test predictions and log-loss
+test_pred <- predict(rf_final, test, type = "prob")
+test_log_loss <- bind_cols(test_pred, test) |>
+  mn_log_loss(truth = Survived, 
+              .pred_1,
+              event_level = "second")
+```
+
+```{r}
+test_log_loss
+```
+:::
+
+## d. Method 2: Permute *after* fitting
+
+Use the fitted model from question (a.) to perform permutation feature
+importance. Shuffle/permute each variable individually on the *test set*
+before making predictions. Record the loss. Repeat $M=10$ times and
+produce a boxplot of the change in loss (change from reported loss from
+part b.).
+
+::: {.callout-note title="Solution"}
+```{r}
+# calculate loss with one feature permuted
+calc_perm_loss <- function(data, model, feature) {
+  perm_data <- data
+  perm_data[[feature]] <- sample(perm_data[[feature]])
+  
+  preds <- predict(model, perm_data, type = "prob")
+  results <- bind_cols(preds, data |> select(Survived))
+  
+  mn_log_loss(results, 
+              truth = Survived, 
+              .pred_1,
+              event_level = "second")$.estimate
+}
+
+test_pred <- predict(rf_final, test, type = "prob")
+```
+
+```{r}
+# get baseline loss
+baseline_loss <- bind_cols(test_pred, test |> select(Survived)) |>
+  mn_log_loss(truth = Survived, 
+              .pred_1,
+              event_level = "second") |>
+  pull(.estimate)
+```
+
+```{r}
+set.seed(101)
+M <- 10
+features <- names(train)[names(train) != "Survived"]
+```
+
+```{r}
+perm_results <- map_dfr(1:M, function(m) {
+  map_dfr(features, function(feat) {
+    loss <- calc_perm_loss(test, rf_final, feat)
+    tibble(
+      feature = feat,
+      iteration = m,
+      loss_change = loss - baseline_loss
+    )
+  })
+})
+```
+
+```{r}
+ggplot(perm_results, 
+       aes(x = reorder(feature, loss_change, FUN = median), 
+           y = loss_change)) +
+  geom_boxplot() +
+  coord_flip() +
+  theme_minimal() +
+  labs(
+    x = "Feature",
+    y = "Change in Loss",
+    title = "Permutation Feature Importance (After Fitting)"
+  )
+```
+:::
+
+## e. Method 3: Permute *before* fitting
+
+For this approach, shuffle/permute the *training data* and re-fit the
+ensemble model. Evaluate the predictions on the (unaltered) test data.
+Repeat $M=10$ times (for each predictor variable) and produce a boxplot
+of the change in loss.
+
+::: {.callout-note title="Solution"}
+```{r}
+fit_perm_model <- function(train_data, test_data, feature) {
+  perm_train <- train_data
+  perm_train[[feature]] <- sample(perm_train[[feature]])
+  perm_fit <- rf_wflow |>
+    finalize_workflow(best_params) |>
+    fit(data = perm_train)
+  preds <- predict(perm_fit, test_data, type = "prob")
+  results <- bind_cols(preds, test_data |> select(Survived))
+  mn_log_loss(results, 
+              truth = Survived, 
+              .pred_1,
+              event_level = "second")$.estimate
+}
+```
+
+```{r}
+baseline_loss <- bind_cols(test_pred, test |> select(Survived)) |>
+  mn_log_loss(truth = Survived, 
+              .pred_1,
+              event_level = "second") |>
+  pull(.estimate)
+```
+
+```{r}
+set.seed(101)
+M <- 10
+features <- names(train)[names(train) != "Survived"]
+```
+
+```{r}
+perm_before_results <- map_dfr(1:M, function(m) {
+  map_dfr(features, function(feat) {
+    loss <- fit_perm_model(train, test, feat)
+    tibble(
+      feature = feat,
+      iteration = m,
+      loss_change = loss - baseline_loss
+    )
+  })
+})
+```
+
+```{r}
+ggplot(perm_before_results, 
+       aes(x = reorder(feature, loss_change, FUN = median), 
+           y = loss_change)) +
+  geom_boxplot() +
+  coord_flip() +
+  theme_minimal() +
+  labs(
+    x = "Feature",
+    y = "Change in Loss",
+    title = "Permutation Feature Importance (Before Fitting)"
+  )
+```
+:::
+
+## f. Understanding
+
+Describe the benefits of each of the three approaches to measure feature
+importance.
+
+::: {.callout-note title="Solution"}
+Method 1: Built-in Importance 
+* computationally efficient 
+* directly tied to how the model makes decisions (split criteria) 
+* identifies features used in interactions since it sees how features are used together in trees 
+* doesn't need additional data or model refitting 
+* limited to tree-based models only
+
+Method 2: Permute After Fitting 
+* works with any type of model 
+* tests feature importance in prediction phase 
+* computationally efficient compared to permute before 
+* shows reliance on features for making predictions 
+* reveals how robust predictions are to noise in individual features 
+
+Method 3: Permute Before Fitting 
+* shows how important features are to the learning process itself 
+* reveals if model compensates for missing feature information during training 
+* identifies fundamental features that can't be replaced by other features 
+* best for feature selection decisions before model deployment 
+:::
+
+# Problem 2: Effects of correlated predictors
+
+This problem will illustrate what happens to the importance scores when
+there are highly associated predictors.
+
+## a. Create an almost duplicate feature
+
+Create a new feature `Sex2` that is 95% the same as `Sex`. Do this by
+selecting 5% of training ($n=50$) and testing ($n=15$) data and flip the
+`Sex` value.
+
+::: {.callout-note title="Solution"}
+```{r}
+set.seed(101)
+n_flip_train <- round(0.05 * nrow(train))
+flip_idx_train <- sample(1:nrow(train), n_flip_train)
+```
+
+```{r}
+train <- train |>
+  mutate(Sex2 = Sex) |>
+  mutate(Sex2 = if_else(row_number() %in% flip_idx_train,
+                        if_else(Sex2 == "male", "female", "male"),
+                        Sex2)) |>
+  mutate(Sex2 = factor(Sex2))
+```
+
+```{r}
+n_flip_test <- round(0.05 * nrow(test))
+flip_idx_test <- sample(1:nrow(test), n_flip_test)
+```
+
+```{r}
+test <- test |>
+  mutate(Sex2 = Sex) |>
+  mutate(Sex2 = if_else(row_number() %in% flip_idx_test,
+                        if_else(Sex2 == "male", "female", "male"),
+                        Sex2)) |>
+  mutate(Sex2 = factor(Sex2))
+```
+:::
+
+## b. Method 1: Built-in importance
+
+Fit the same model as in Problem 1b, but use the new data that includes
+`Sex2` (i.e., use both `Sex` and `Sex2` in the model). Calculate the
+built-in feature importance score and produce a barplot.
+
+::: {.callout-note title="Solution"}
+```{r}
+# recipe including Sex2
+rf_rec2 <- recipe(Survived ~ ., data = train) |>
+  step_normalize(all_numeric_predictors()) |>
+  step_impute_median(all_numeric_predictors())
+```
+
+```{r}
+# randomforest
+rf_spec2 <- rand_forest(
+  mtry = tune(),
+  trees = 1000,
+  min_n = tune()
+) |>
+  set_engine("ranger", importance = "impurity", probability = TRUE) |>
+  set_mode("classification")
+```
+
+```{r}
+# workflow
+rf_wflow2 <- workflow() |>
+  add_recipe(rf_rec2) |>
+  add_model(rf_spec2)
+```
+
+```{r}
+# CV
+cv_folds2 <- vfold_cv(train, v = 10, strata = Survived)
+```
+
+```{r}
+# tuning grid
+rf_grid2 <- grid_regular(
+  mtry(range = c(2, 8)),
+  min_n(range = c(4, 14)),
+  levels = c(6, 6)
+)
+```
+
+```{r}
+# tune model
+set.seed(101)
+rf_tuned2 <- rf_wflow2 |>
+  tune_grid(
+    resamples = cv_folds2,
+    grid = rf_grid2,
+    metrics = metric_set(mn_log_loss),
+    control = control_grid(event_level = "second")
+  )
+```
+
+```{r}
+# best params
+best_params2 <- select_best(rf_tuned2, metric = "mn_log_loss")
+```
+
+```{r}
+# Fit final w/ best params
+rf_final2 <- rf_wflow2 |>
+  finalize_workflow(best_params2) |>
+  fit(data = train)
+```
+
+```{r}
+rf_final2 |>
+  extract_fit_parsnip() |>
+  vip(num_features = 8) +
+  theme_minimal() +
+  labs(title = "Random Forest Feature Importance w/ Sex2")
+```
+
+:::
+
+## c. Method 2: Permute *after* fitting
+
+Redo Method 2 (problem 1d) on the new data/model and produce a boxplot
+of importance scores. The importance score is defined as the difference
+in loss.
+
+::: {.callout-note title="Solution"}
+```{r}
+# calculate loss with one feature permuted
+calc_perm_loss2 <- function(data, model, feature) {
+  perm_data <- data
+  perm_data[[feature]] <- sample(perm_data[[feature]])
+  
+  preds <- predict(model, perm_data, type = "prob")
+  results <- bind_cols(preds, data |> select(Survived))
+  
+  mn_log_loss(results,
+              truth = Survived,
+              .pred_1,
+              event_level = "second")$.estimate
+}
+```
+
+
+```{r}
+# get baseline loss
+test_pred2 <- predict(rf_final2, test, type = "prob")
+baseline_loss2 <- bind_cols(test_pred2, test |> select(Survived)) |>
+  mn_log_loss(truth = Survived,
+              .pred_1,
+              event_level = "second") |>
+  pull(.estimate)
+```
+
+```{r}
+set.seed(123)
+M <- 10
+features2 <- names(train)[!names(train) %in% c("Survived")]
+```
+
+
+```{r}
+# permutation importance
+perm_results2 <- map_dfr(1:M, function(m) {
+  map_dfr(features2, function(feat) {
+    loss <- calc_perm_loss2(test, rf_final2, feat)
+    tibble(
+      feature = feat,
+      iteration = m,
+      loss_change = loss - baseline_loss2
+    )
+  })
+})
+```
+
+```{r}
+ggplot(perm_results2, 
+       aes(x = reorder(feature, loss_change, FUN = median),
+           y = loss_change)) +
+  geom_boxplot() +
+  coord_flip() +
+  theme_minimal() +
+  labs(
+    x = "Feature",
+    y = "Change in Loss",
+    title = "Permutation Feature Importance (After Fitting) w/ Sex2"
+  )
+```
+:::
+
+## d. Method 3: Permute *before* fitting
+
+Redo Method 3 (problem 1e) on the new data and produce a boxplot of
+importance scores. The importance score is defined as the difference in
+loss.
+
+::: {.callout-note title="Solution"}
+```{r}
+# Function to fit model with permuted feature
+fit_perm_model2 <- function(train_data, test_data, feature) {
+  perm_train <- train_data
+  perm_train[[feature]] <- sample(perm_train[[feature]])
+  
+  perm_fit <- rf_wflow2 |>
+    finalize_workflow(best_params2) |>
+    fit(data = perm_train)
+
+  preds <- predict(perm_fit, test_data, type = "prob")
+  results <- bind_cols(preds, test_data |> select(Survived))
+
+  mn_log_loss(results,
+              truth = Survived,
+              .pred_1,
+              event_level = "second")$.estimate
+}
+```
+
+```{r}
+# get baseline loss
+baseline_loss2 <- bind_cols(test_pred2, test |> select(Survived)) |>
+  mn_log_loss(truth = Survived,
+              .pred_1,
+              event_level = "second") |>
+  pull(.estimate)
+```
+
+```{r}
+set.seed(123)
+M <- 10
+features2 <- names(train)[!names(train) %in% c("Survived")]
+```
+
+
+```{r}
+# permutation importance
+perm_before_results2 <- map_dfr(1:M, function(m) {
+  map_dfr(features2, function(feat) {
+    loss <- fit_perm_model2(train, test, feat)
+    tibble(
+      feature = feat,
+      iteration = m,
+      loss_change = loss - baseline_loss2
+    )
+  })
+})
+```
+
+```{r}
+ggplot(perm_before_results2,
+       aes(x = reorder(feature, loss_change, FUN = median),
+           y = loss_change)) +
+  geom_boxplot() +
+  coord_flip() +
+  theme_minimal() +
+  labs(
+    x = "Feature",
+    y = "Change in Loss",
+    title = "Permutation Feature Importance (Before Fitting) w/ Sex2"
+  )
+```
+:::
+
+## e. Understanding
+
+Describe how the addition of the almost duplicated predictor impacted
+the feature importance results.
+
+::: {.callout-note title="Solution"}
+Method 1:
+* The importance scores for both Sex and Sex2 were lower than Sex importance in problem 1
+* This makes sense because the model splits the importance between two highly correlated features  
+* total combined importance of Sex and Sex2 is roughly similar to the original importance of Sex alone
+* suggests the model uses both features somewhat interchangeably
+
+Method 2:
+* When Sex or Sex2 is permuted individually, the impact is less severe than when Sex is used alone
+* when one sex variable is permuted, the model can still rely on the other one 
+* this makes each individual feature appear less important, even though gender is still crucial 
+
+Method 3:
+* permuting either Sex or Sex2 during training has less impact because model can learn from other 
+* model builds alternative decision paths using whichever sex variable remains unpermuted
+* creates a more robust model in terms of gender prediction, but each individual less important
+:::

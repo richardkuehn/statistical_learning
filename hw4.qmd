@@ -1,0 +1,235 @@
+---
+title: "Homework #4: Trees and Random Forest" 
+author: "Richard 'Ricky' Kuehn"
+format: ds6030hw-html
+---
+
+::: {style="background-color:yellow; color:red; display: block; border-color: black; padding:1em"}
+This is an **independent assignment**. Do not discuss or work with classmates.
+:::
+
+```{r config, include=FALSE}
+# Set global configurations and settings here
+knitr::opts_chunk$set()                 # set global chunk options
+ggplot2::theme_set(ggplot2::theme_bw()) # set ggplot2 theme
+```
+
+# Required R packages and Directories {.unnumbered .unlisted}
+
+```{r packages, message=FALSE, warning=FALSE}
+data_dir = 'https://mdporter.github.io/teaching/data/' # data directory
+library(tidyverse)    # functions for data manipulation  
+library(ranger)       # fast random forest implementation
+library(modeldata)    # for the ames housing data
+library(tidymodels)   # for cross-validation
+```
+
+# Problem 1: Tree splitting metrics for classification
+
+Consider the Gini index, classification error, and entropy impurity measures in a simple classification setting with two classes.
+
+Create a single plot that displays each of these quantities as a function of $p_m$, the estimated probability of an observation in node $m$ being from class 1. The x-axis should display $p_m$, ranging from 0 to 1, and the y-axis should display the value of the Gini index, classification error, and entropy.
+
+```{r}
+# get p_m and complement
+p_m <- seq(0, 1, 0.01)
+p_comp <- 1 - p_m
+
+# gini formula for binary classification
+gini <- 2 * p_m * p_comp
+
+# misclassification error
+misclass <- 1 - pmax(p_m, p_comp)
+
+# cross-entropy
+entropy <- (-1 * p_m * log2(p_m)) + (-1 * p_comp * log2(p_comp))
+
+# dataframe
+df <- data.frame(
+  p_m = rep(p_m, 3),
+  impur = c(gini, misclass, entropy),
+  type = rep(c('gini', 'misclassification', 'cross-entropy'), each = length(p_m))
+)
+
+# plot p_m and impurity measures
+ggplot(df, aes(p_m, impur, color = type)) +
+  geom_line() +
+  theme_minimal()
+```
+
+# Problem 2: Combining bootstrap estimates
+
+```{r, echo=FALSE}
+p_red = c(0.2, 0.25, 0.3, 0.4, 0.4, 0.45, 0.7, 0.85, 0.9, 0.9)
+```
+
+Suppose we produce ten bootstrapped samples from a data set containing red and green classes. We then apply a classification tree to each bootstrapped sample and, for a specific value of $X$, produce the following 10 estimates of $\Pr(\text{Class is Red} \mid X=x)$: $\{`r stringr::str_c(p_red, sep=", ")`\}$.
+
+## a. Majority Vote
+
+ISLR 8.2 describes the *majority vote* approach for making a hard classification from a set of bagged classifiers. What is the final classification for this example using majority voting?
+
+::: {.callout-note title="Solution"}
+```{r}
+# reclassify to 'red' or 'green' if > or < 0.5
+reclass <- ifelse(p_red > 0.5, 'red', 'green')
+count <- table(reclass)
+count
+```
+
+Because the value count of green is greater than red, the majority vote classification would be 'green'.
+:::
+
+## b. Average Probability
+
+An alternative is to base the final classification on the average probability. What is the final classification for this example using average probability?
+
+::: {.callout-note title="Solution"}
+```{r}
+# average vector values to find single probability
+avg <- mean(p_red)
+print(avg)
+if (avg > 0.5) 'red' else 'green'
+```
+
+Because the average of all the values is greater than 0.5, the average probability classification would be 'red'.
+:::
+
+# Problem 3: Random Forest Tuning
+
+Random forest has several tuning parameters that you will explore in this problem. We will use the `ames` housing data from the `modeldata` R package.
+
+There are several R packages for Random Forest. The `ranger::ranger()` function is much faster than `randomForest::randomForest()` so we will use this one.
+
+## a. Random forest (`ranger`) tuning parameters
+
+List all of the random forest tuning parameters in the `ranger::ranger()` function. You don't need to list the parameters related to computation, special models (e.g., survival, maxstat), or anything that won't impact the predictive performance.
+
+Indicate the tuning parameters you think will be most important to optimize?
+
+::: {.callout-note title="Solution"}
+*Main tuning parameters:*
+
+-   num.trees : number of trees
+-   mtry : number of variables randomly sampled as candidates at each split
+-   min.node.size : minimum node size
+-   replace : sample with/without replacement
+-   sample.fraction : fraction of observations to sample
+-   splitrule : split rule (default 'gini' for classification, default 'variance' for regression)
+
+*Most important tuning parameters:* The most important tuning parameters to optimize are 'mtry' and 'min.node.size'.
+:::
+
+## b. Implement Random Forest
+
+Use a random forest model to predict the sales price, `Sale_Price`. Use the default parameters and report the 10-fold cross-validation RMSE (square root of mean squared error).
+
+::: {.callout-note title="Solution"}
+```{r}
+# load ames data
+data(ames)
+# ames
+```
+
+```{r}
+# set seed
+set.seed(101)
+
+# 10-fold cv
+ames_folds <- vfold_cv(ames, v = 10)
+
+# default parameters model
+rf1 <- rand_forest(mode = "regression") |>
+  set_engine('ranger')
+
+# workflow
+rf1_wflow <- 
+  workflow() |>
+  add_model(rf1) |>
+  add_formula(Sale_Price ~ .)
+
+# fit
+rf1_fit <- 
+  rf1_wflow |>
+  fit_resamples(ames_folds)
+
+# metrics
+rf1_metric <- 
+  rf1_fit |>
+  collect_metrics()
+
+rf1_metric
+```
+
+The average rmse is 26,758.04 with default parameters.
+:::
+
+## c. Random Forest Tuning
+
+Now we will vary the tuning parameters of `mtry` and `min.bucket` to see what effect they have on performance.
+
+-   Use a range of reasonable `mtry` and `min.bucket` values.
+    -   The valid `mtry` values are $\{1,2, \ldots, p\}$ where $p$ is the number of predictor variables. However the default value of `mtry = sqrt(p) =` `r sqrt(ncol(ames)-1) %>% floor()` is usually close to optimal, so you may want to focus your search around those values.
+    -   The default `min.bucket=1` will grow deep trees. This will usually work best if there are enough trees. But try some values larger and see how it impacts predictive performance.
+    -   Set `num.trees=1000`, which is larger than the default of 500.
+-   Use 5 times repeated out-of-bag (OOB) to assess performance. That is, run random forest 5 times for each tuning set, calculate the OOB MSE each time and use the average for the MSE associated with the tuning parameters.
+-   Use a single plot to show the average MSE as a function of `mtry` and `min.bucket`.
+-   Report the best tuning parameter combination.
+-   Note: random forest is a stochastic model; it will be different every time it runs due to the bootstrap sampling and random selection of features to consider for splitting. Set the random seed to control the uncertainty associated with the stochasticity.
+-   Hint: If you use the `ranger` package, the `prediction.error` element in the output is the OOB MSE.
+
+::: {.callout-note title="Solution"}
+```{r}
+# data
+data(ames)
+
+# set seed
+set.seed(101)
+
+# tuning grid
+p <- ncol(ames) - 1
+mtry_def <- floor(sqrt(p))
+mtry_vals <- c(mtry_def - 2, mtry_def - 1, mtry_def, mtry_def + 1, mtry_def + 2)
+min_node_size_vals <- c(1, 2, 5, 10, 20)
+
+tune_grid <- expand_grid(
+  mtry = mtry_vals,
+  min_node_size = min_node_size_vals
+)
+
+# fit function
+fit_rf <- function(mtry, min_node_size) {
+  mse_values <- replicate(5, {
+    rf <- ranger(
+      formula = Sale_Price ~ .,
+      data = ames,
+      num.trees = 1000,
+      mtry = mtry,
+      min.node.size = min_node_size,
+      oob.error = TRUE,
+      seed = 101
+    )
+    rf$prediction.error
+  })
+  mean(mse_values)
+}
+
+# get oob_mse for each combination of mtry, min_node_size
+results <- tune_grid %>%
+  rowwise() %>%
+  mutate(oob_mse = fit_rf(mtry, min_node_size))
+
+# arrange by lowest oob_mse
+results |>
+  arrange(oob_mse) 
+
+# plot results
+ggplot(results, aes(x = factor(mtry), y = factor(min_node_size), fill = oob_mse)) +
+  geom_tile() +
+  scale_fill_viridis_c(direction = -1) +
+  labs(x = "mtry", y = "min.node.size", fill = "OOB MSE") +
+  theme_minimal() +
+  ggtitle("Random Forest Tuning Results")
+```
+Hmmmm that still doesn't look right but I have tried too many different ways to answer this problem.
+:::

@@ -1,0 +1,472 @@
+---
+title: "Homework #5: Probability and Classification" 
+author: "Richard 'Ricky' Kuehn"
+format: ds6030hw-html
+---
+
+```{r config, include=FALSE}
+# Set global configurations and settings here
+knitr::opts_chunk$set()                 # set global chunk options
+ggplot2::theme_set(ggplot2::theme_bw()) # set ggplot2 theme
+```
+
+# Required R packages and Directories {.unnumbered .unlisted}
+
+```{r packages, message=FALSE, warning=FALSE}
+dir_data= 'https://mdporter.github.io/teaching/data/' # data directory
+library(glmnet)
+library(tidyverse) # functions for data manipulation  
+library(tidymodels)
+library(yardstick)
+library(ggplot2)
+library(ranger)
+```
+
+# Crime Linkage
+
+Crime linkage attempts to determine if a set of unsolved crimes share a common offender. *Pairwise* crime linkage is the more simple task of deciding if two crimes share a common offender; it can be considered a binary classification problem. The linkage training data has 8 evidence variables that measure the similarity between a pair of crimes:
+
+-   `spatial` is the spatial distance between the crimes
+-   `temporal` is the fractional time (in days) between the crimes
+-   `tod` and `dow` are the differences in time of day and day of week between the crimes
+-   `LOC`, `POA,` and `MOA` are binary with a 1 corresponding to a match (type of property, point of entry, method of entry)
+-   `TIMERANGE` is the time between the earliest and latest possible times the crime could have occurred (because the victim was away from the house during the crime).
+-   The response variable indicates if the crimes are linked ($y=1$) or unlinked ($y=0$).
+
+These problems use the [linkage-train](%60r%20file.path(dir_data,%20%22linkage_train.csv%22)%20%60) and [linkage-test](%60r%20file.path(dir_data,%20%22linkage_test.csv%22)%20%60) datasets (click on links for data).
+
+## Load Crime Linkage Data
+
+::: {.callout-note title="Solution"}
+```{r}
+crime_train <- read_csv(file.path(dir_data, 'linkage_train.csv'))
+```
+
+```{r}
+crime_test <- read_csv(file.path(dir_data, 'linkage_test.csv'))
+```
+
+```{r}
+head(crime_train)
+```
+
+```{r}
+head(crime_test)
+```
+:::
+
+# Problem 1: Penalized Regression for Crime Linkage
+
+## a. Fit a penalized *linear regression* model to predict linkage.
+
+Use an elastic net penalty (including lasso and ridge) (your choice).
+
+-   Report the value of $\alpha \in [0, 1]$ used.
+-   Report the value of $\lambda$ used.
+-   Report the estimated coefficients.
+
+::: {.callout-note title="Solution"}
+```{r}
+# split
+X <- as.matrix(crime_train[, 1:8])
+y <- crime_train$y
+
+# set alpha value
+alpha_1a <- 1
+
+# linear fit
+set.seed(101)
+cv_1a <- cv.glmnet(X, y, alpha = alpha_1a)
+
+# best lambda
+best_1a <- cv_1a$lambda.min
+
+# fit with best lambda
+mod_1a <- glmnet(X, y, alpha = alpha_1a, lambda = best_1a)
+
+# coef
+coef_1a <- coef(mod_1a)
+
+# report
+cat('alpha:', alpha_1a, '\n')
+cat('best lambda:', best_1a, '\n')
+cat('coefficients:', '\n')
+coef_1a
+```
+:::
+
+## b. Fit a penalized *logistic regression* model to predict linkage.
+
+Use an elastic net penalty (including lasso and ridge) (your choice).
+
+-   Report the value of $\alpha \in [0, 1]$ used.
+-   Report the value of $\lambda$ used.
+-   Report the estimated coefficients.
+
+::: {.callout-note title="Solution"}
+```{r}
+# alpha
+alpha_1b <- 0.25
+
+# log fit
+set.seed(101)
+cv_1b <- cv.glmnet(X, y, alpha = alpha_1b, family = 'binomial')
+
+# best lambda
+best_1b <- cv_1b$lambda.min
+
+# fit with best lambda
+mod_1b <- glmnet(X, y, alpha = alpha_1b, lambda = best_1b)
+
+# coef
+coef_1b <- coef(mod_1b)
+
+# report
+cat('alpha:', alpha_1b, '\n')
+cat('best lambda:', best_1b, '\n')
+cat('coefficients:', '\n')
+coef_1b
+```
+:::
+
+# Problem 2: Random Forest for Crime Linkage
+
+Fit a random forest model to predict crime linkage.
+
+-   Report the loss function (or splitting rule) used.
+-   Report any non-default tuning parameters.
+-   Report the variable importance (indicate which importance method was used).
+
+::: {.callout-note title="Solution"}
+```{r}
+# fit random forest
+set.seed(101)
+mod_rf <- ranger(
+    y ~ ., 
+    data = crime_train, 
+    num.trees = 500,
+    importance = 'impurity')
+
+# report
+cat('loss function :', mod_rf$splitrule, '\n')
+cat('tuning parameters: num.trees =', mod_rf$num.trees, '\n')
+cat('variable importance: impurity', '\n')
+print(importance(mod_rf))
+```
+:::
+
+# Problem 3: ROC Curves
+
+## a. ROC curve: training data
+
+Produce one plot that has the ROC curves, using the *training data*, for all three models (linear, logistic, and random forest). Use color and/or linetype to distinguish between models and include a legend.\
+Also report the AUC (area under the ROC curve) for each model. Again, use the *training data*.
+
+-   Note: you should be weary of being asked to evaluation predictive performance from the same data used to estimate the tuning and model parameters. The next problem will walk you through a more proper way of evaluating predictive performance with resampling.
+
+::: {.callout-note title="Solution"}
+```{r}
+# make predictions
+pred_lin <- as.vector(predict(mod_1a, newx = X, s = best_1a))
+pred_log <- as.vector(predict(mod_1b, newx = X, s = best_1b, type = "response"))
+pred_rf <- predict(mod_rf, data = crime_train)$predictions
+
+# combine predictions and true values
+results <- tibble(
+  true = factor(y, levels=c(1,0)),
+  linear = pred_lin,
+  logistic = pred_log,
+  randomforest = pred_rf
+)
+
+# calculate ROC curves
+roc_linear <- roc_curve(results, true, linear)
+roc_logistic <- roc_curve(results, true, logistic)
+roc_randomforest <- roc_curve(results, true, randomforest)
+
+# plot ROC curves
+ggplot() +
+  geom_path(data = roc_linear, aes(x = 1 - specificity, y = sensitivity, color = "linear"), size = 1) +
+  geom_path(data = roc_logistic, aes(x = 1 - specificity, y = sensitivity, color = "logistic", linetype = "logistic"), size = 1) +
+  geom_path(data = roc_randomforest, aes(x = 1 - specificity, y = sensitivity, color = "randomforest"), size = 1) +
+  scale_color_manual(values = c("linear" = "red", "logistic" = "blue", "randomforest" = "green")) +
+  scale_linetype_manual(values = c("linear" = "solid", "logistic" = "dotted", "randomforest" = "solid")) +
+  labs(title = "ROC Curves (Training Data)",
+       x = "1 - specificity",
+       y = "sensitivity") +
+  theme_minimal()
+
+# calculate AUC
+auc_linear <- roc_auc(results, true, linear)
+auc_logistic <- roc_auc(results, true, logistic)
+auc_randomforest <- roc_auc(results, true, randomforest)
+
+# report AUC
+cat("linear AUC:", auc_linear$.estimate, "\n")
+cat("logistic AUC:", auc_logistic$.estimate, "\n")
+cat("randomforest AUC:", auc_randomforest$.estimate, "\n")
+```
+:::
+
+## b. ROC curve: resampling estimate
+
+Recreate the ROC curve from the penalized logistic regression (logreg) and random forest (rf) models using repeated hold-out data. The following steps will guide you:
+
+-   For logreg, use $\alpha=.75$. For rf use *mtry = 2*, *num.trees = 1000*, and fix any other tuning parameters at your choice.
+-   Run the following steps 25 times:
+    i.  Hold out 500 observations.
+    ii. Use the remaining observations to estimate $\lambda$ using 10-fold CV for the logreg model. Don't tune any rf parameters.
+    iii. Predict the probability of linkage for the 500 hold-out observations.
+    iv. Store the predictions and hold-out labels.
+    v.  Calculate the AUC.
+-   Report the mean AUC and standard error for both models. Compare to the results from part a.
+-   Produce two plots showing the 25 ROC curves for each model.
+-   Note: by estimating $\lambda$ each iteration, we are incorporating the uncertainty present in estimating that tuning parameter.
+
+::: {.callout-note title="Solution"}
+```{r}
+library(purrr)
+set.seed(101)
+
+# Prepare the data
+crime_data <- crime_train |>
+  select(y, everything()) 
+
+len_rows <- nrow(crime_data)
+len_rows
+
+head(crime_data)
+```
+
+```{r}
+# create monte carlo CV splits
+mc_splits <- mc_cv(crime_data, prop = (len_rows - 500)/len_rows, times = 25)
+mc_splits
+```
+
+```{r}
+# empty tibble
+results_3b <- tibble(
+  resample_id = character(),
+  model = character(),
+  roc_data = list(),
+  auc = numeric())
+
+# function to iterate through splits and store roc, auc
+fit_calculate_roc <- function(split, resample_id) {
+  train <- analysis(split)
+  test <- assessment(split)
+  test$y <- factor(test$y, levels = c(1, 0))
+  
+  # log reg
+  cv_fit <- cv.glmnet(as.matrix(train[,-1]), train$y, alpha = 0.75, family = "binomial")
+  logreg_model <- glmnet(as.matrix(train[,-1]), train$y, alpha = 0.75, lambda = cv_fit$lambda.min)
+  logreg_pred <- predict(logreg_model, newx = as.matrix(test[,-1]), type = "response")[,1]
+  
+  # rf
+  rf_model <- ranger(y ~ ., data = train, num.trees = 1000, mtry = 2, probability = TRUE)
+  rf_pred <- predict(rf_model, data = test)$predictions[,2]
+  
+  # temporary df for roc calculations
+  test_logreg <- test |> mutate(.pred = logreg_pred)
+  test_rf <- test |> mutate(.pred = rf_pred)
+  
+  # calculate roc and auc
+  roc_logreg <- roc_curve(test_logreg, y, .pred)
+  roc_rf <- roc_curve(test_rf, y, .pred)
+  auc_logreg <- roc_auc(test_logreg, y, .pred)$.estimate
+  auc_rf <- roc_auc(test_rf, y, .pred)$.estimate
+  
+  # add to tibble
+  results_3b <<- results_3b |>
+    add_row(resample_id = resample_id, model = "Logistic Regression", roc_data = list(roc_logreg), auc = auc_logreg) |>
+    add_row(resample_id = resample_id, model = "Random Forest", roc_data = list(roc_rf), auc = auc_rf)
+  
+  print('done')
+}
+```
+
+```{r}
+# apply function to all splits
+walk2(mc_splits$splits, mc_splits$id, fit_calculate_roc)
+```
+
+```{r}
+# peek at filled table
+head(results_3b)
+```
+
+```{r}
+# extract roc data for plot
+roc_data <- results_3b |>
+  unnest(roc_data) |>
+  rename(iteration = resample_id)
+
+# remove where threshold is infinite
+roc_data <- roc_data |>
+  filter(!is.infinite(.threshold))
+
+# separate for plots
+roc_logreg <- roc_data |> filter(model == "Logistic Regression")
+roc_rf <- roc_data |> filter(model == "Random Forest")
+```
+
+```{r}
+# calculate mean and standard error for auc
+auc_summary <- results_3b |>
+  group_by(model) |>
+  summarize(
+    mean_auc = mean(auc),
+    se_auc = sd(auc) / sqrt(n()))
+
+print(auc_summary)
+```
+
+In this problem, the mean auc is a little lower for logreg and much lower for random forest. This was anticipated, as I believed earlier we were overfitting.
+
+```{r}
+# logreg plot
+ggplot(roc_logreg, aes(x = 1 - specificity, y = sensitivity, group = iteration)) +
+  geom_line(alpha = 0.5, color = "blue") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray") +
+  labs(title = "Logistic Regression ROC Curves",
+       x = "1 - Specificity",
+       y = "Sensitivity") +
+  theme_minimal() +
+  coord_equal()
+```
+
+```{r}
+# rf plot
+ggplot(roc_rf, aes(x = 1 - specificity, y = sensitivity, group = iteration)) +
+  geom_line(alpha = 0.5, color = "green") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray") +
+  labs(title = "Random Forest ROC Curves",
+       x = "1 - Specificity",
+       y = "Sensitivity") +
+  theme_minimal() +
+  coord_equal()
+```
+:::
+
+# Problem 4: Contest
+
+## a. Contest Part 1: Predict the estimated *probability* of linkage.
+
+Predict the estimated *probability* of linkage for the test data (using any model).
+
+-   Submit a .csv file (ensure comma separated format) named `lastname_firstname_1.csv` that includes the column named **p** that is your estimated posterior probability. We will use automated evaluation, so the format must be exact.
+-   You are free to any model (even ones we haven't yet covered in the course).
+-   You are free to use any data transformation or feature engineering.
+-   You will receive credit for a proper submission; the top five scores will receive 2 bonus points.\
+-   Your probabilities will be evaluated with respect to the mean negative Bernoulli log-likelihood (known as the average *log-loss* metric): $$ 
+    L = - \frac{1}{M} \sum_{i=1}^m [y_i \log \, \hat{p}_i + (1 - y_i) \log \, (1 - \hat{p}_i)]
+    $$ where $M$ is the number of test observations, $\hat{p}_i$ is the prediction for the $i$th test observation, and $y_i \in \{0,1\}$ are the true test set labels.
+
+::: {.callout-note title="Solution"}
+```{r}
+set.seed(101)
+
+# fit random forest model
+mod_contest <- ranger(
+    y ~ ., 
+    data = crime_train, 
+    num.trees = 1000,
+    mtry = 2,
+    probability = TRUE
+)
+
+# predict on test data
+pred_contest <- predict(mod_rf, data = crime_test)$predictions
+
+# summary
+summary(pred_contest)
+
+# submission
+submission <- data.frame(p = pred_contest)
+head(submission)
+
+# CSV
+write.csv(submission, "Kuehn_Ricky_1.csv", row.names = FALSE)
+```
+:::
+
+## b. Contest Part 2: Predict the *linkage label*.
+
+Predict the linkages for the test data (using any model).
+
+-   Submit a .csv file (ensure comma separated format) named `lastname_firstname_2.csv` that includes the column named **linkage** that takes the value of 1 for linked pairs and 0 for unlinked pairs. We will use automated evaluation, so the format must be exact.
+-   You are free to any model (even ones we haven't yet covered in the course).
+-   You are free to use any data transformation or feature engineering.
+-   Your labels will be evaluated based on total cost, where cost is equal to `1*FP + 8*FN`. This implies that False Negatives (FN) are 8 times as costly as False Positives (FP).\
+-   You will receive credit for a proper submission; the top five scores will receive 2 bonus points. Note: you only will get bonus credit for one of the two contests.
+
+::: {.callout-note title="Solution"}
+```{r}
+hist(crime_train$y, breaks = 100, main = "Distribution of True Values")
+table(crime_train$y)
+prop.table(table(crime_train$y)) * 100
+```
+
+```{r}
+library(caret)
+
+# calculate cost
+calculate_cost <- function(true_labels, predicted_labels) {
+    confusion_matrix <- table(true_labels, predicted_labels)
+    fp <- confusion_matrix["0", "1"]
+    fn <- confusion_matrix["1", "0"]
+    return(fp + 8 * fn)
+}
+
+# cross-validation
+set.seed(101)
+cv_splits <- createFolds(crime_train$y, k = 10)
+thresholds <- seq(0.01, 0.99, by = 0.01)
+cv_costs <- matrix(NA, nrow = length(thresholds), ncol = 10)
+
+# Perform cross-validation
+for (i in 1:10) {
+    val_idx <- cv_splits[[i]]
+    
+    # predict using mod_contest
+    pred_rf_cv <- predict(mod_contest, data = crime_train[val_idx,])$predictions[,1]
+    
+    # calculate cost for each threshold
+    for (j in 1:length(thresholds)) {
+        pred_labels <- factor(ifelse(pred_rf_cv >= thresholds[j], 1, 0), levels = c(0, 1))
+        cv_costs[j, i] <- calculate_cost(factor(crime_train$y[val_idx], levels = c(0, 1)), pred_labels)
+    }}
+
+# find threshold with lowest mean cost
+mean_costs <- rowMeans(cv_costs)
+best_threshold <- thresholds[which.min(mean_costs)]
+
+# predict on test data
+pred_rf <- predict(mod_contest, data = crime_test)$predictions[,1]
+
+# final predictions using best threshold
+final_predictions <- ifelse(pred_rf >= best_threshold, 1, 0)
+
+# submission
+submission <- data.frame(linkage = final_predictions)
+
+# Plot the mean costs vs thresholds
+plot(thresholds, mean_costs, type = "l", xlab = "Threshold", ylab = "Mean Cost")
+abline(v = best_threshold, col = "red", lty = 2)
+
+# histograms
+hist(pred_rf, breaks = 100, main = "Distribution of Predicted Probabilities", xlab = "Probability")
+hist(final_predictions, breaks = 100, main = "Distribution of Final Predictions", xlab = "Probability")
+
+# CSV 
+write.csv(submission, "Kuehn_Ricky_2.csv", row.names = FALSE)
+```
+
+```{r}
+table(final_predictions)
+prop.table(table(final_predictions)) * 100
+```
+
+I think I have something backwards in my code, but I couldn't figure it out. So, I'm submitting but not confident.
+:::
